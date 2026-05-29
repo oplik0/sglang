@@ -1,10 +1,12 @@
 import ast
+import html
 import json
 import logging
 import re
 from typing import Any, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -53,6 +55,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+        # Accumulated parameters for the current tool call, used for end-of-generation tracking
+        self._accumulated_params: dict = {}
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -90,6 +94,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self, param_value: str, param_name: str, param_config: dict, func_name: str
     ) -> Any:
         """Convert parameter value based on its type in the schema."""
+        param_value = html.unescape(param_value)
+
         # Handle null value for any type
         if param_value.lower() == "null":
             return None
@@ -113,6 +119,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return param_value
         elif (
             param_type.startswith("int")
+            or param_type.startswith("integer")
             or param_type.startswith("uint")
             or param_type.startswith("long")
             or param_type.startswith("short")
@@ -184,7 +191,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 if self.tool_call_prefix in text:
                     raw_tool_calls = [text]
 
+            tool_indices = self._get_tool_indices(tools)
             tool_idx = 0
+            last_end = 0
             for tool_content in raw_tool_calls:
                 # Find function calls
                 funcs = self.tool_call_function_regex.findall(tool_content)
@@ -196,6 +205,15 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     name_end = func_body.index(">")
                     func_name = func_body[:name_end]
                     params_str = func_body[name_end + 1 :]
+
+                    if func_name not in tool_indices:
+                        # Unknown function
+                        logger.warning(f"Unknown function: {func_name}")
+                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                            # Return tool call block as normal text
+                            match_end = text.find(">", last_end) + 1
+                            last_end = match_end
+                            continue
 
                     param_config = self._get_arguments_config(func_name, tools)
                     parsed_params = {}
@@ -224,6 +242,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         )
                     )
                     tool_idx += 1
+                    last_end = name_end + 1
 
             # Determine normal text (text before the first tool call)
             start_idx = text.find(self.tool_call_start_token)
@@ -281,6 +300,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.current_tool_param_count = 0
                     self.json_started = False
                     self.current_func_name = func_name
+                    self._accumulated_params = {}
+
+                    # Ensure tracking arrays are large enough for end-of-generation checker
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": func_name,
+                        "arguments": {},
+                    }
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
 
                     calls.append(
                         ToolCallItem(
@@ -348,6 +378,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                                 )
                             )
                             self.json_started = True
+                            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                                self.streamed_args_for_tool.append("")
+                            self.streamed_args_for_tool[self.current_tool_id] += "{"
 
                         param_config = self._get_arguments_config(
                             self.current_func_name, tools
@@ -372,6 +405,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         )
                         self.current_tool_param_count += 1
 
+                        # Update accumulated params and tracking arrays for end-of-generation checker
+                        self._accumulated_params[param_name] = converted_val
+                        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = self._accumulated_params.copy()
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+                        self.streamed_args_for_tool[self.current_tool_id] += fragment
+
                         # Advance cursor
                         total_len = (name_end + 1) + end_pos + end_token_len
                         self.parsed_pos += total_len
@@ -389,12 +429,21 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         ToolCallItem(tool_index=self.current_tool_id, parameters="{")
                     )
                     self.json_started = True
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    self.streamed_args_for_tool[self.current_tool_id] += "{"
 
                 calls.append(
                     ToolCallItem(tool_index=self.current_tool_id, parameters="}")
                 )
                 self.parsed_pos += len(self.function_end_token)
                 self.current_func_name = None
+
+                # Update tracking arrays for end-of-generation checker
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+                self.streamed_args_for_tool[self.current_tool_id] += "}"
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = self._accumulated_params.copy()
                 continue
 
             # -------------------------------------------------------
